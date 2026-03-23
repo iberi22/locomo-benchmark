@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    container_name: benchmark-surrealdb
+    ports:
+      - "8000:8000"
+    command: start --protocol ws --bind 0.0.0.0:8000
+    networks:
+      - benchmark-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  cortex:
+    image: ghcr.io/southwest-ai-labs/cortex:latest
+    container_name: benchmark-cortex
+    ports:
+      - "8003:8003"
+    environment:
+      - CORTEX_SURREAL_URL=ws://surrealdb:8000
+      - CORTEX_TOKEN=dev-token
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+    networks:
+      - benchmark-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  engram:
+    image: ghcr.io/gentleman-programming/engram:latest
+    container_name: benchmark-engram
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_ENV=production
+    networks:
+      - benchmark-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  openclaw-engram:
+    image: ghcr.io/joshuaswarren/openclaw-engram:latest
+    container_name: benchmark-openclaw-engram
+    ports:
+      - "8081:8081"
+    environment:
+      - NODE_ENV=production
+      - ENGRAM_API_URL=http://engram:8080
+    depends_on:
+      engram:
+        condition: service_healthy
+    networks:
+      - benchmark-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+networks:
+  benchmark-net:
+    driver: bridge

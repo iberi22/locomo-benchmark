@@ -1,0 +1,115 @@
+name: Weekly Comparison Report
+
+on:
+  schedule:
+    # Run every Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      compare_from:
+        description: 'Start date (YYYY-MM-DD)'
+        required: false
+      compare_to:
+        description: 'End date (YYYY-MM-DD)'
+        required: false
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  weekly-report:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for trend analysis
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Download historical results
+        run: |
+          # Get results from last 30 days
+          python scripts/fetch_historical_results.py \
+            --days 30 \
+            --output results/history/
+
+      - name: Generate trend analysis
+        run: |
+          python scripts/trend_analysis.py \
+            --data results/history/ \
+            --output results/trends.json
+
+      - name: Generate weekly comparison
+        run: |
+          python scripts/weekly_comparison.py \
+            --trends results/trends.json \
+            --output results/weekly_report.md \
+            --from-date ${{ inputs.compare_from || '30 days ago' }} \
+            --to-date ${{ inputs.compare_to || 'today' }}
+
+      - name: Create PR with weekly report
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "📈 Weekly benchmark comparison report"
+          title: "Weekly Benchmark Report $(date +'%Y-%m-%d')"
+          body: |
+            ## 📊 Weekly Memory Systems Benchmark Comparison
+
+            This PR contains the weekly benchmark comparison report.
+
+            ### Summary
+            - Accuracy trends
+            - Performance changes
+            - Recommendations
+
+            ### Full Report
+            See `results/weekly_report.md`
+          branch: weekly-report/$(date +'%Y-%m-%d')
+          delete-branch: true
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-report
+          path: |
+            results/weekly_report.md
+            results/trends.json
+          retention-days: 90
+
+  slack-notification:
+    needs: weekly-report
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        if: secrets.SLACK_WEBHOOK_URL
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "📊 *Weekly Benchmark Report Ready*",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Weekly memory systems benchmark comparison is complete.\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Results>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

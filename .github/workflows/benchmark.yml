@@ -1,0 +1,141 @@
+name: Memory System Benchmark
+
+on:
+  push:
+    branches: [main, production/*]
+  workflow_dispatch:
+    inputs:
+      adapters:
+        description: 'Adapters to run (comma-separated, or "all")'
+        required: false
+        default: 'all'
+
+env:
+  CORTEX_API_URL: http://localhost:8003
+  CORTEX_TOKEN: ${{ secrets.CORTEX_TOKEN || 'dev-token' }}
+
+jobs:
+  benchmark:
+    runs-on: ${{ vars.SELF_HOSTED_RUNNER || 'ubuntu-latest' }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [cortex, engram, openclaw_engram]
+        include:
+          - adapter: cortex
+            setup_script: ./scripts/setup_cortex.sh
+          - adapter: engram
+            setup_script: ./scripts/setup_engram.sh
+          - adapter: openclaw_engram
+            setup_script: ./scripts/setup_engram.sh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Cache Docker images
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.docker-cache
+          key: ${{ runner.os }}-docker-${{ hashFiles('**/Dockerfile*') }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+
+      - name: Setup memory system
+        run: |
+          bash ${{ matrix.setup_script }}
+
+      - name: Wait for services
+        run: |
+          echo "Waiting for services to be ready..."
+          sleep 10
+          
+      - name: Verify services
+        run: |
+          python scripts/verify_services.py
+
+      - name: Run benchmark - ${{ matrix.adapter }}
+        id: benchmark
+        run: |
+          python src/benchmark_runner.py \
+            --adapter ${{ matrix.adapter }} \
+            --output results/${{ matrix.adapter }}_results.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.adapter }}-results
+          path: results/${{ matrix.adapter }}_results.json
+          retention-days: 30
+
+      - name: Store timestamp
+        run: |
+          echo "BENCHMARK_TIMESTAMP=$(date +'%Y-%m-%d_%H-%M-%S')" >> $GITHUB_ENV
+
+      - name: Cleanup services
+        if: always()
+        run: |
+          docker compose -f docker/benchmark-compose.yml down || true
+
+  collect-results:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: results/raw
+
+      - name: Aggregate results
+        run: |
+          python scripts/aggregate_results.py \
+            --input results/raw \
+            --output results/summary.json
+
+      - name: Generate comparison report
+        run: |
+          python scripts/generate_report.py \
+            --results results/summary.json \
+            --output results/comparison_report.md
+
+      - name: Update leaderboard
+        run: |
+          python scripts/update_leaderboard.py \
+            --results results/summary.json
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary
+          path: |
+            results/summary.json
+            results/comparison_report.md
+            results/leaderboard.md
+          retention-days: 90
+
+      - name: Commit results
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          file_pattern: |
+            results/*.json
+            results/*.md
+          commit_message: "📊 Auto-update benchmark results ${{ env.BENCHMARK_TIMESTAMP }}"
+          skip_dirty_check: false

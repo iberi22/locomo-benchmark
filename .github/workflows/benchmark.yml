@@ -22,14 +22,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        adapter: [cortex]
-        include:
-          - adapter: cortex
-            setup_script: ./scripts/setup_cortex.sh
-          - adapter: engram
-            setup_script: ./scripts/setup_engram.sh
-          - adapter: openclaw_engram
-            setup_script: ./scripts/setup_engram.sh
+        adapter:
+          - cortex
+        setup_script:
+          - ./scripts/setup_cortex.sh
 
     steps:
       - name: Checkout repository

@@ -169,7 +169,7 @@ class BenchmarkRunner:
         """Calculate aggregate metrics from benchmark results."""
         total = len(results)
         correct = sum(1 for pred, exp, _ in results if self.evaluate_answer(pred, exp))
-        accuracies = [1 if self.evaluate_answer(pred, exp, _) else 0 for pred, exp, _ in results]
+        accuracies = [1 if self.evaluate_answer(pred, exp) else 0 for pred, exp, _ in results]
 
         # Latency statistics
         latencies = [lat for _, _, lat in results]

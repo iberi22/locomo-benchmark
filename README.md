@@ -49,6 +49,17 @@ cat results/latest/*.json
 
 ## 🔧 Benchmark Protocol
 
+## 🔐 Required GitHub Secrets
+
+To run benchmarks in CI, configure these secrets in your GitHub repository settings (`Settings > Secrets and variables > Actions`):
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `CORTEX_TOKEN` | No | API token for Cortex authentication. Falls back to `dev-token` if not set. |
+| `SLACK_WEBHOOK_URL` | No | Webhook URL for Slack notifications (used by weekly report workflow) |
+
+> **Note:** The benchmark workflow uses `ubuntu-latest` runners and only runs the `cortex` adapter in CI. Other adapters (engram, openclaw_engram) require Docker images from GHCR that need authentication and local services not available in CI. Run them locally for full comparison.
+
 See [BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md) for:
 - Detailed explanation of the LoCoMo benchmark
 - How to interpret results

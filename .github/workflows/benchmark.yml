@@ -13,7 +13,11 @@ on:
 env:
   CI: true
   CORTEX_API_URL: http://localhost:8003
+  # CORTEX_TOKEN: Set this secret in GitHub repo settings
+  # Required secret: CORTEX_TOKEN - API token for Cortex authentication
+  # Fallback: 'dev-token' is used if secret not configured
   CORTEX_TOKEN: ${{ secrets.CORTEX_TOKEN || 'dev-token' }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   benchmark:
@@ -23,6 +27,10 @@ jobs:
       fail-fast: false
       matrix:
         adapter:
+          # NOTE: Only 'cortex' adapter is enabled in CI.
+          # Disabled adapters (engram, openclaw_engram) require GHCR Docker images
+          # that need authentication. They also require localhost services not
+          # available on ubuntu-latest runners. Run these locally with Docker.
           - cortex
         setup_script:
           - ./scripts/setup_cortex.sh
@@ -54,15 +62,14 @@ jobs:
           
       - name: Verify services
         run: |
-          python scripts/verify_services.py || true
+          python scripts/verify_services.py || echo "WARNING: Service verification failed, continuing..."
 
       - name: Run benchmark - ${{ matrix.adapter }}
         id: benchmark
-        continue-on-error: true
         run: |
           python src/benchmark_runner.py \
             --adapter ${{ matrix.adapter }} \
-            --output results/${{ matrix.adapter }}_results.json || true
+            --output results/${{ matrix.adapter }}_results.json
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -85,7 +92,7 @@ jobs:
   collect-results:
     needs: benchmark
     runs-on: ubuntu-latest
-    if: always()
+    if: success() || failure()
     
     steps:
       - name: Checkout repository
@@ -112,20 +119,20 @@ jobs:
         run: |
           python scripts/aggregate_results.py \
             --input results/raw \
-            --output results/summary.json || true
+            --output results/summary.json || echo "WARNING: Aggregation failed"
 
       - name: Generate comparison report
         if: steps.results_check.outputs.has_results == 'true'
         run: |
           python scripts/generate_report.py \
             --results results/summary.json \
-            --output results/comparison_report.md || true
+            --output results/comparison_report.md || echo "WARNING: Report generation failed"
 
       - name: Update leaderboard
         if: steps.results_check.outputs.has_results == 'true'
         run: |
           python scripts/update_leaderboard.py \
-            --results results/summary.json || true
+            --results results/summary.json || echo "WARNING: Leaderboard update failed"
 
       - name: Upload summary
         uses: actions/upload-artifact@v4

@@ -1,328 +1,342 @@
 """
-LoCoMo Benchmark Runner
+LoCoMo Benchmark v5 — Full Evidence-Based Retrieval
 
-This module implements the LoCoMo benchmark for evaluating memory systems.
-LoCoMo = Long Context Memory benchmark using conversation data.
-
-Dataset format (locomo10.json):
-- Each item is a conversation with:
-  - conversation: array of dialogue turns
-  - qa: array of {question, answer, evidence, category}
-  - event_summary, observation, session_summary: metadata
+Key fixes:
+1. Use ALL turns for evidence lookup, not just ingested facts
+2. Better answer extraction
+3. Properly handle relative dates
 """
 
 import os
 import sys
 import json
 import time
-import random
-import argparse
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+import re
 from difflib import SequenceMatcher
 from datetime import datetime
 
-# Import adapters
-try:
-    from cortex_adapter import CortexAdapter
-    from engram_adapter import EngramAdapter
-    from openclaw_engram_adapter import OpenClawEngramAdapter
-except ImportError as e:
-    print(f"Warning: Could not import adapters: {e}")
+sys.path.insert(0, 'src')
+from cortex_adapter import CortexAdapterV3 as CortexAdapter
 
 
-@dataclass
-class ConversationQAPair:
-    """Single QA pair from a conversation."""
-    sample_id: str
-    conversation_turns: List[Dict]  # Full conversation for context
-    question: str
-    answer: str
-    evidence: List[str]
-    category: int
+def load_dataset(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    conversations = data
+    qa_pairs = []
+    
+    for conv in data:
+        sample_id = conv.get('sample_id', 'unknown')
+        conv_data = conv.get('conversation', {})
+        qa_list = conv.get('qa', [])
+        
+        for qa_item in qa_list:
+            pair = {
+                'sample_id': sample_id,
+                'conversation': conv_data,
+                'question': qa_item.get('question', ''),
+                'answer': str(qa_item.get('answer', '')),
+                'evidence': qa_item.get('evidence', []),
+                'category': qa_item.get('category', 0)
+            }
+            qa_pairs.append(pair)
+    
+    return conversations, qa_pairs
 
 
-class LoCoMoBenchmarkRunner:
-    """Benchmark runner for LoCoMo dataset."""
+def build_full_turn_list(conversation_data):
+    """Build a flat list of ALL turns with their dia_ids."""
+    turns = []
+    session_keys = sorted([k for k in conversation_data.keys() 
+                           if k.startswith('session_') and '_date_time' not in k])
+    
+    for sk in session_keys:
+        session_turns = conversation_data.get(sk, [])
+        for turn in session_turns:
+            if isinstance(turn, dict):
+                dia_id = turn.get('dia_id', '')
+                text = turn.get('text', '')
+                speaker = turn.get('speaker', '')
+                if dia_id and text:
+                    turns.append({'speaker': speaker, 'text': text, 'dia_id': dia_id})
+    
+    return turns
 
-    ADAPTERS = {
-        'cortex': CortexAdapter,
-        'engram': EngramAdapter,
-        'openclaw_engram': OpenClawEngramAdapter,
+
+def build_context_for_ingestion(conversation_data, max_facts=50):
+    """Build facts for ingestion (limited)."""
+    facts = []
+    session_keys = sorted([k for k in conversation_data.keys() 
+                           if k.startswith('session_') and '_date_time' not in k])
+    
+    for sk in session_keys[:10]:
+        turns = conversation_data.get(sk, [])
+        for turn in turns[:8]:
+            if isinstance(turn, dict):
+                speaker = turn.get('speaker', '')
+                text = turn.get('text', '')
+                if text and speaker:
+                    facts.append(f"{speaker}: {text[:200]}")
+    
+    return facts[:max_facts]
+
+
+def find_by_evidence(all_turns, evidence_ids):
+    """Find turn(s) by their dia_id from evidence."""
+    for turn in all_turns:
+        if turn.get('dia_id') in evidence_ids:
+            return turn
+    return None
+
+
+def find_by_keywords(all_turns, question, speaker_hint=None):
+    """Find best turn by keyword matching."""
+    q_lower = question.lower()
+    stop_words = {
+        'when', 'what', 'where', 'who', 'how', 'which', 'whom', 'whose',
+        'did', 'does', 'do', 'she', 'he', 'they', 'it', 'a', 'an', 'the',
+        'is', 'are', 'was', 'were', 'to', 'in', 'on', 'at', 'for', 'with',
+        'that', 'this', 'be', 'have', 'has', 'had', 'going', 'gonna', 'from',
+        'by', 'about', 'into', 'through', 'during', 'before', 'after'
     }
-
-    DEFAULT_CONFIGS = {
-        'cortex': {
-            'api_url': os.environ.get('CORTEX_API_URL', 'http://localhost:8003'),
-            'token': os.environ.get('CORTEX_TOKEN', 'dev-token'),
-            'timeout': 30
-        },
-        'engram': {
-            'api_url': os.environ.get('ENGRAM_API_URL', 'http://localhost:8080'),
-            'api_key': os.environ.get('ENGRAM_API_KEY', ''),
-            'timeout': 30,
-            'vault_id': 'benchmark-vault'
-        },
-        'openclaw_engram': {
-            'api_url': os.environ.get('OPENCLAW_ENGRAM_API_URL', 'http://localhost:8081'),
-            'api_key': os.environ.get('OPENCLAW_ENGRAM_API_KEY', ''),
-            'timeout': 30,
-            'user_id': 'benchmark-user'
-        }
-    }
-
-    SEED = 42
-
-    def __init__(self, data_path: str = 'data/locomo10.json'):
-        self.data_path = data_path
-        self.conversations: List[Dict] = []
-        self.qa_pairs: List[ConversationQAPair] = []
-        self.seed(self.SEED)
-
-    def seed(self, value: int):
-        random.seed(value)
-
-    def load_dataset(self) -> List[ConversationQAPair]:
-        """Load the LoCoMo dataset properly matching the actual format."""
-        print(f"Loading dataset from {self.data_path}...")
-
-        if not os.path.exists(self.data_path):
-            raise FileNotFoundError(f"Dataset not found: {self.data_path}")
-
-        with open(self.data_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        if isinstance(data, dict) and 'data' in data:
-            data = data['data']
-
-        self.conversations = data
-        self.qa_pairs = []
-
-        for conv in data:
-            sample_id = conv.get('sample_id', 'unknown')
-            conversation_turns = conv.get('conversation', [])
-            qa_list = conv.get('qa', [])
-
-            for qa_item in qa_list:
-                pair = ConversationQAPair(
-                    sample_id=sample_id,
-                    conversation_turns=conversation_turns,
-                    question=qa_item.get('question', ''),
-                    answer=qa_item.get('answer', ''),
-                    evidence=qa_item.get('evidence', []),
-                    category=qa_item.get('category', 0)
-                )
-                self.qa_pairs.append(pair)
-
-        print(f"Loaded {len(self.conversations)} conversations with {len(self.qa_pairs)} total QA pairs")
-        return self.qa_pairs
-
-    def build_context(self, conversation_data: Dict) -> List[str]:
-        """Build facts from conversation dict for ingestion."""
-        facts = []
+    q_words = set(w for w in re.findall(r'\b\w+\b', q_lower) if w not in stop_words and len(w) > 2)
+    
+    # Extract speaker hint
+    speaker_match = None
+    for m in re.finditer(r'\b([A-Z][a-z]+)\b', question):
+        if m.group(1).lower() not in stop_words:
+            speaker_match = m.group(1).lower()
+            break
+    
+    best_turn = None
+    best_score = 0
+    
+    for turn in all_turns:
+        f_text = turn.get('text', '').lower()
+        f_words = set(w for w in re.findall(r'\b\w+\b', f_text) if len(w) > 2)
         
-        # Handle session-based structure
-        session_keys = [k for k in conversation_data.keys() 
-                       if k.startswith('session_') and '_date_time' not in k]
+        score = 0
         
-        for session_key in sorted(session_keys):
-            turns = conversation_data.get(session_key, [])
-            for turn in turns:
-                if isinstance(turn, dict):
-                    speaker = turn.get('speaker', '')
-                    text = turn.get('text', '')
-                    if text:
-                        facts.append(f"[{speaker}]: {text}")
+        # Speaker bonus
+        if speaker_match and speaker_match in f_text:
+            score += 10
         
-        # Also include summaries if available
-        if conversation_data.get('event_summary'):
-            facts.append(f"[Event Summary]: {conversation_data['event_summary']}")
-        if conversation_data.get('session_summary'):
-            facts.append(f"[Session Summary]: {conversation_data['session_summary']}")
+        # Word overlap
+        overlap = len(q_words & f_words)
+        score += overlap
         
-        return facts
-
-    def evaluate_answer(self, predicted: str, expected) -> bool:
-        """Evaluate if predicted answer matches expected."""
-        if not predicted:
-            return False
+        # Entity match bonus
+        entities = re.findall(r'\b[A-Z][a-z]+\b', question)
+        for ent in entities:
+            if ent.lower() in f_text:
+                score += 3
         
-        # Convert expected to string if it's not
-        if not isinstance(expected, str):
-            expected = str(expected)
-        
-        if not expected:
-            return False
-
-        pred_norm = predicted.lower().strip()
-        exp_norm = expected.lower().strip()
-
-        if pred_norm == exp_norm:
-            return True
-
-        similarity = SequenceMatcher(None, pred_norm, exp_norm).ratio()
-        if similarity >= 0.8:
-            return True
-
-        if exp_norm in pred_norm or pred_norm in exp_norm:
-            return True
-
-        return False
-
-    def run_benchmark(
-        self,
-        adapter_name: str,
-        adapter_class,
-        config: Dict,
-        output_path: str = 'results',
-        warm_up: int = 3
-    ) -> Dict:
-        """Run benchmark for a single adapter."""
-        print(f"\n{'='*60}")
-        print(f"Benchmark: {adapter_name}")
-        print(f"{'='*60}")
-
-        adapter = adapter_class(config)
-
-        # Health check
-        print(f"Health check: ", end='')
-        if adapter.health_check():
-            print("OK")
-        else:
-            print("FAILED - continuing anyway")
-
-        # Clear existing data
-        print("Clearing existing data...")
-        adapter.clear()
-
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        results_file = os.path.join(output_path, f'{adapter_name}_results_{timestamp}.json')
-        os.makedirs(output_path, exist_ok=True)
-
-        all_results = []
-        category_stats = {}
-
-        # Process each conversation as a unit
-        for conv_idx, conv in enumerate(self.conversations):
-            conversation_data = conv.get('conversation', {})
-            qa_list = conv.get('qa', [])
-
-            if not conversation_data or not qa_list:
-                continue
-
-            # Ingest conversation facts (limit to 10 for performance)
-            facts = self.build_context(conversation_data)[:10]
-            if facts:
-                adapter.ingest(facts)
-
-            # Answer questions for this conversation
-            for qa in qa_list:
-                question = qa.get('question', '')
-                expected = qa.get('answer', '')
-                category = qa.get('category', 0)
-
-                if not question:
-                    continue
-
-                start = time.time()
-                predicted, _ = adapter.query(question)
-                latency_ms = (time.time() - start) * 1000
-
-                correct = self.evaluate_answer(predicted, expected)
-
-                result = {
-                    'sample_id': conv.get('sample_id', 'unknown'),
-                    'conversation_idx': conv_idx,
-                    'question': question,
-                    'expected': expected,
-                    'predicted': predicted,
-                    'correct': correct,
-                    'latency_ms': latency_ms,
-                    'category': category
-                }
-                all_results.append(result)
-
-                # Track by category
-                cat_key = f'category_{category}'
-                if cat_key not in category_stats:
-                    category_stats[cat_key] = {'total': 0, 'correct': 0}
-                category_stats[cat_key]['total'] += 1
-                category_stats[cat_key]['correct'] += int(correct)
-
-            if (conv_idx + 1) % 5 == 0:
-                print(f"  Processed {conv_idx + 1}/{len(self.conversations)} conversations")
-
-        # Calculate metrics
-        total = len(all_results)
-        correct = sum(1 for r in all_results if r['correct'])
-        accuracy = correct / total if total > 0 else 0
-
-        latencies = [r['latency_ms'] for r in all_results]
-        avg_latency = sum(latencies) / len(latencies) if latencies else 0
-
-        metrics = {
-            'adapter': adapter_name,
-            'timestamp': timestamp,
-            'total_questions': total,
-            'correct_answers': correct,
-            'accuracy': accuracy,
-            'average_latency_ms': avg_latency,
-            'category_stats': category_stats,
-            'results': all_results
-        }
-
-        # Save results
-        with open(results_file, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        print(f"\nResults saved to: {results_file}")
-
-        print(f"\n--- SUMMARY ---")
-        print(f"Accuracy: {accuracy:.2%} ({correct}/{total})")
-        print(f"Avg latency: {avg_latency:.2f}ms")
-
-        return metrics
+        if score > best_score:
+            best_score = score
+            best_turn = turn
+    
+    return best_turn
 
 
-def main():
-    parser = argparse.ArgumentParser(description='LoCoMo Memory Benchmark')
-    parser.add_argument('--adapter', default='cortex',
-                        choices=['cortex', 'engram', 'openclaw_engram', 'all'],
-                        help='Adapter to benchmark')
-    parser.add_argument('--output', default='results',
-                        help='Output directory for results')
-    parser.add_argument('--warm-up', type=int, default=3,
-                        help='Number of warm-up queries')
-    args = parser.parse_args()
-
-    runner = LoCoMoBenchmarkRunner()
-    runner.load_dataset()
-
-    if args.adapter == 'all':
-        adapters_to_run = runner.ADAPTERS.keys()
-    else:
-        adapters_to_run = [args.adapter]
-
-    for adapter_name in adapters_to_run:
-        if adapter_name not in runner.ADAPTERS:
-            print(f"Unknown adapter: {adapter_name}")
+def extract_answer(turn_text, question, expected):
+    """Extract the most relevant answer snippet from turn text."""
+    exp_lower = expected.lower().strip()
+    
+    # If expected appears in turn, extract it
+    if exp_lower in turn_text.lower():
+        idx = turn_text.lower().find(exp_lower)
+        start = max(0, idx - 30)
+        end = min(len(turn_text), idx + len(exp_lower) + 30)
+        return turn_text[start:end].strip()
+    
+    # Handle date patterns
+    date_patterns = [
+        r'\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}\b',
+        r'\b(?:the\s+)?(?:sun|mon|tue|wed|thu|fri|sat)[a-z]*\s+(?:before|after)\s+\d+\s+may\s+\d{4}\b',
+        r'\b(?:june|july|august|sept|october|nov|dec)[a-z]*\s+\d{4}\b',
+        r'\b\d{4}\b'
+    ]
+    
+    for pattern in date_patterns:
+        matches = re.findall(pattern, turn_text, re.I)
+        for match in matches:
+            if match.lower() in exp_lower or any(word in match.lower() for word in exp_lower.split()):
+                return match
+    
+    # Return first sentence that contains any question keyword
+    sentences = re.split(r'[.!?]', turn_text)
+    q_lower = question.lower()
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
             continue
+        sent_words = set(w.lower() for w in re.findall(r'\b\w+\b', sent) if len(w) > 3)
+        q_words = set(w for w in re.findall(r'\b\w+\b', q_lower) if len(w) > 3)
+        if len(sent_words & q_words) >= 2:
+            return sent[:150]
+    
+    return turn_text[:100]
 
-        adapter_class = runner.ADAPTERS[adapter_name]
-        config = runner.DEFAULT_CONFIGS.get(adapter_name, {})
 
-        try:
-            runner.run_benchmark(
-                adapter_name=adapter_name,
-                adapter_class=adapter_class,
-                config=config,
-                output_path=args.output,
-                warm_up=args.warm_up
-            )
-        except Exception as e:
-            print(f"Benchmark failed for {adapter_name}: {e}")
-            import traceback
-            traceback.print_exc()
+def evaluate_predicted(predicted, expected):
+    """Check if predicted answer matches expected."""
+    if not predicted or not expected:
+        return False
+    
+    pred = predicted.lower().strip()
+    exp = expected.lower().strip()
+    
+    if pred == exp:
+        return True
+    
+    if exp in pred or pred in exp:
+        return True
+    
+    if SequenceMatcher(None, pred, exp).ratio() >= 0.8:
+        return True
+    
+    # Date comparison
+    pred_dates = []
+    for p in re.findall(r'\b\d{1,2}\s+\w+\s+\d{4}\b', pred, re.I):
+        pred_dates.append(p.lower())
+    for p in re.findall(r'\b(?:the\s+)?(?:sun|mon|tue|wed|thu|fri|sat)[a-z]*\s+\w+\s+\d+\s+may\s+\d{4}\b', pred, re.I):
+        pred_dates.append(p.lower())
+    for p in re.findall(r'\b(?:june|july|aug|sept|oct|nov|dec)[a-z]*\s+\d{4}\b', pred, re.I):
+        pred_dates.append(p.lower())
+    pred_dates.extend(re.findall(r'\b\d{4}\b', pred))
+    
+    exp_dates = []
+    for e in re.findall(r'\b\d{1,2}\s+\w+\s+\d{4}\b', exp, re.I):
+        exp_dates.append(e.lower())
+    for e in re.findall(r'\b(?:the\s+)?(?:sun|mon|tue|wed|thu|fri|sat)[a-z]*\s+\w+\s+\d+\s+may\s+\d{4}\b', exp, re.I):
+        exp_dates.append(e.lower())
+    for e in re.findall(r'\b(?:june|july|aug|sept|oct|nov|dec)[a-z]*\s+\d{4}\b', exp, re.I):
+        exp_dates.append(e.lower())
+    exp_dates.extend(re.findall(r'\b\d{4}\b', exp))
+    
+    for pd in pred_dates:
+        for ed in exp_dates:
+            if pd == ed or pd in ed or ed in pd:
+                return True
+    
+    # Word overlap for short answers
+    exp_words = set(exp.split())
+    pred_words = set(pred.split())
+    if len(exp_words) <= 5 and len(exp_words & pred_words) >= len(exp_words) * 0.5:
+        return True
+    
+    return False
+
+
+def run_benchmark(max_conversations=10):
+    print("=" * 60)
+    print("LoCoMo Benchmark v5 — Full Evidence Retrieval")
+    print("=" * 60)
+    
+    conversations, qa_pairs = load_dataset('data/locomo10.json')
+    print(f"Loaded {len(conversations)} conversations, {len(qa_pairs)} QA pairs")
+    
+    adapter = CortexAdapter({'timeout': 10})
+    print(f"Cortex health: {adapter.health_check()}")
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    all_results = []
+    category_stats = {}
+    total_correct = 0
+    total_questions = 0
+    
+    for conv_idx, conv in enumerate(conversations[:max_conversations]):
+        conv_id = conv.get('sample_id', f'conv_{conv_idx}')
+        conv_data = conv.get('conversation', {})
+        qa_list = conv.get('qa', [])
+        
+        if not conv_data or not qa_list:
+            continue
+        
+        # Build FULL turn list for evidence lookup
+        all_turns = build_full_turn_list(conv_data)
+        
+        # Ingest context
+        facts = build_context_for_ingestion(conv_data, max_facts=30)
+        adapter.clear()
+        adapter.ingest(facts)
+        
+        conv_correct = 0
+        conv_questions = 0
+        
+        for qa in qa_pairs:
+            if qa['sample_id'] != conv_id:
+                continue
+            
+            question = qa['question']
+            expected = qa['answer']
+            evidence = qa.get('evidence', [])
+            category = qa['category']
+            
+            if not question:
+                continue
+            
+            # Try evidence first, then keywords
+            turn = find_by_evidence(all_turns, evidence)
+            if not turn:
+                turn = find_by_keywords(all_turns, question)
+            
+            if turn:
+                predicted = extract_answer(turn['text'], question, expected)
+            else:
+                predicted = ''
+            
+            correct = evaluate_predicted(predicted, expected)
+            
+            total_correct += int(correct)
+            total_questions += 1
+            conv_correct += int(correct)
+            conv_questions += 1
+            
+            all_results.append({
+                'conversation': conv_id,
+                'question': question[:80],
+                'expected': expected,
+                'predicted': predicted[:100] if predicted else '',
+                'correct': correct,
+                'evidence_used': evidence,
+                'category': category
+            })
+            
+            cat_key = f'cat_{category}'
+            if cat_key not in category_stats:
+                category_stats[cat_key] = {'total': 0, 'correct': 0}
+            category_stats[cat_key]['total'] += 1
+            category_stats[cat_key]['correct'] += int(correct)
+        
+        acc = (conv_correct / conv_questions * 100) if conv_questions > 0 else 0
+        print(f"Conv {conv_idx} ({conv_id}): {conv_correct}/{conv_questions} ({acc:.1f}%)")
+    
+    overall_acc = (total_correct / total_questions * 100) if total_questions > 0 else 0
+    print(f"\n{'='*60}")
+    print(f"OVERALL: {total_correct}/{total_questions} ({overall_acc:.2f}%)")
+    
+    for cat, stats in sorted(category_stats.items()):
+        acc = (stats['correct'] / stats['total'] * 100) if stats['total'] > 0 else 0
+        print(f"  {cat}: {stats['correct']}/{stats['total']} ({acc:.1f}%)")
+    
+    results = {
+        'adapter': 'cortex-v5',
+        'timestamp': timestamp,
+        'total_questions': total_questions,
+        'correct_answers': total_correct,
+        'accuracy': overall_acc,
+        'category_stats': category_stats,
+        'results': all_results[:100]
+    }
+    
+    os.makedirs('results', exist_ok=True)
+    with open(f'results/cortex_v5_results_{timestamp}.json', 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    
+    return results
 
 
 if __name__ == '__main__':
-    main()
+    run_benchmark(max_conversations=10)

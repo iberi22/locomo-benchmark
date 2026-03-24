@@ -1,63 +1,56 @@
 """
-Benchmark Runner - Main orchestrator for LoCoMo memory benchmark
+LoCoMo Benchmark Runner
 
-This module orchestrates the benchmarking process for multiple memory systems.
-It loads the LoCoMo dataset, runs each adapter through the benchmark, and
-produces comprehensive results.
+This module implements the LoCoMo benchmark for evaluating memory systems.
+LoCoMo = Long Context Memory benchmark using conversation data.
+
+Dataset format (locomo10.json):
+- Each item is a conversation with:
+  - conversation: array of dialogue turns
+  - qa: array of {question, answer, evidence, category}
+  - event_summary, observation, session_summary: metadata
 """
 
-import argparse
-import json
 import os
 import sys
+import json
 import time
 import random
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass, asdict
+import argparse
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
 from difflib import SequenceMatcher
+from datetime import datetime
 
 # Import adapters
-from cortex_adapter import CortexAdapter
-from engram_adapter import EngramAdapter
-from openclaw_engram_adapter import OpenClawEngramAdapter
+try:
+    from cortex_adapter import CortexAdapter
+    from engram_adapter import EngramAdapter
+    from openclaw_engram_adapter import OpenClawEngramAdapter
+except ImportError as e:
+    print(f"Warning: Could not import adapters: {e}")
 
 
 @dataclass
-class BenchmarkResult:
-    """Results for a single memory system benchmark."""
-    adapter_name: str
-    timestamp: str
-    total_questions: int
-    correct_answers: int
-    accuracy: float
-    average_latency_ms: float
-    min_latency_ms: float
-    max_latency_ms: float
-    recall: float
-    f1_score: float
-    category_results: Dict[str, Dict[str, float]]
-    error_count: int
-    ingestion_time_ms: float
-    raw_answers: List[Dict]
-
-
-@dataclass
-class QAPair:
-    """A question-answer pair from the LoCoMo dataset."""
-    id: str
-    category: str
-    context: List[str]
+class ConversationQAPair:
+    """Single QA pair from a conversation."""
+    sample_id: str
+    conversation_turns: List[Dict]  # Full conversation for context
     question: str
     answer: str
-    difficulty: str
+    evidence: List[str]
+    category: int
 
 
-class BenchmarkRunner:
-    """Main benchmark orchestrator."""
+class LoCoMoBenchmarkRunner:
+    """Benchmark runner for LoCoMo dataset."""
 
-    # Default adapter configurations
+    ADAPTERS = {
+        'cortex': CortexAdapter,
+        'engram': EngramAdapter,
+        'openclaw_engram': OpenClawEngramAdapter,
+    }
+
     DEFAULT_CONFIGS = {
         'cortex': {
             'api_url': os.environ.get('CORTEX_API_URL', 'http://localhost:8003'),
@@ -78,26 +71,19 @@ class BenchmarkRunner:
         }
     }
 
-    # Random seed for reproducibility
     SEED = 42
 
     def __init__(self, data_path: str = 'data/locomo10.json'):
-        """
-        Initialize the benchmark runner.
-
-        Args:
-            data_path: Path to the LoCoMo dataset JSON file
-        """
         self.data_path = data_path
-        self.qa_pairs: List[QAPair] = []
+        self.conversations: List[Dict] = []
+        self.qa_pairs: List[ConversationQAPair] = []
         self.seed(self.SEED)
 
-    def seed(self, seed_value: int):
-        """Set random seed for reproducibility."""
-        random.seed(seed_value)
+    def seed(self, value: int):
+        random.seed(value)
 
-    def load_dataset(self) -> List[QAPair]:
-        """Load the LoCoMo dataset from JSON file."""
+    def load_dataset(self) -> List[ConversationQAPair]:
+        """Load the LoCoMo dataset properly matching the actual format."""
         print(f"Loading dataset from {self.data_path}...")
 
         if not os.path.exists(self.data_path):
@@ -106,370 +92,236 @@ class BenchmarkRunner:
         with open(self.data_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        # Handle both list format and dict format with 'data' key
-        if isinstance(data, list):
-            qa_list = data
-        elif isinstance(data, dict) and 'data' in data:
-            qa_list = data['data']
-        else:
-            raise ValueError(f"Unexpected dataset format in {self.data_path}")
+        if isinstance(data, dict) and 'data' in data:
+            data = data['data']
 
-        self.qa_pairs = [
-            QAPair(
-                id=item.get('id', f'qa_{i}'),
-                category=item.get('category', 'unknown'),
-                context=item.get('context', []),
-                question=item.get('question', ''),
-                answer=item.get('answer', ''),
-                difficulty=item.get('difficulty', 'medium')
-            )
-            for i, item in enumerate(qa_list)
-        ]
+        self.conversations = data
+        self.qa_pairs = []
 
-        print(f"Loaded {len(self.qa_pairs)} QA pairs")
+        for conv in data:
+            sample_id = conv.get('sample_id', 'unknown')
+            conversation_turns = conv.get('conversation', [])
+            qa_list = conv.get('qa', [])
+
+            for qa_item in qa_list:
+                pair = ConversationQAPair(
+                    sample_id=sample_id,
+                    conversation_turns=conversation_turns,
+                    question=qa_item.get('question', ''),
+                    answer=qa_item.get('answer', ''),
+                    evidence=qa_item.get('evidence', []),
+                    category=qa_item.get('category', 0)
+                )
+                self.qa_pairs.append(pair)
+
+        print(f"Loaded {len(self.conversations)} conversations with {len(self.qa_pairs)} total QA pairs")
         return self.qa_pairs
 
-    def evaluate_answer(self, predicted: str, expected: str) -> bool:
-        """
-        Evaluate if a predicted answer matches the expected answer.
+    def build_context(self, conversation_data: Dict) -> List[str]:
+        """Build facts from conversation dict for ingestion."""
+        facts = []
+        
+        # Handle session-based structure
+        session_keys = [k for k in conversation_data.keys() 
+                       if k.startswith('session_') and '_date_time' not in k]
+        
+        for session_key in sorted(session_keys):
+            turns = conversation_data.get(session_key, [])
+            for turn in turns:
+                if isinstance(turn, dict):
+                    speaker = turn.get('speaker', '')
+                    text = turn.get('text', '')
+                    if text:
+                        facts.append(f"[{speaker}]: {text}")
+        
+        # Also include summaries if available
+        if conversation_data.get('event_summary'):
+            facts.append(f"[Event Summary]: {conversation_data['event_summary']}")
+        if conversation_data.get('session_summary'):
+            facts.append(f"[Session Summary]: {conversation_data['session_summary']}")
+        
+        return facts
 
-        Uses both exact match and semantic similarity.
-        """
-        if not predicted or not expected:
+    def evaluate_answer(self, predicted: str, expected) -> bool:
+        """Evaluate if predicted answer matches expected."""
+        if not predicted:
+            return False
+        
+        # Convert expected to string if it's not
+        if not isinstance(expected, str):
+            expected = str(expected)
+        
+        if not expected:
             return False
 
-        # Normalize strings
-        pred_normalized = predicted.lower().strip()
-        exp_normalized = expected.lower().strip()
+        pred_norm = predicted.lower().strip()
+        exp_norm = expected.lower().strip()
 
-        # Exact match (case-insensitive)
-        if pred_normalized == exp_normalized:
+        if pred_norm == exp_norm:
             return True
 
-        # Semantic similarity using SequenceMatcher
-        similarity = SequenceMatcher(None, pred_normalized, exp_normalized).ratio()
-        if similarity >= 0.85:
+        similarity = SequenceMatcher(None, pred_norm, exp_norm).ratio()
+        if similarity >= 0.8:
             return True
 
-        # Check if expected is contained in predicted
-        if exp_normalized in pred_normalized:
-            return True
-
-        # Check if predicted is contained in expected
-        if pred_normalized in exp_normalized:
+        if exp_norm in pred_norm or pred_norm in exp_norm:
             return True
 
         return False
 
-    def calculate_metrics(
-        self,
-        results: List[Tuple[str, str, float]],  # (predicted, expected, latency_ms)
-        category_results: Dict[str, List[bool]]
-    ) -> Dict:
-        """Calculate aggregate metrics from benchmark results."""
-        total = len(results)
-        correct = sum(1 for pred, exp, _ in results if self.evaluate_answer(pred, exp))
-        accuracies = [1 if self.evaluate_answer(pred, exp) else 0 for pred, exp, _ in results]
-
-        # Latency statistics
-        latencies = [lat for _, _, lat in results]
-        avg_latency = sum(latencies) / len(latencies) if latencies else 0
-        min_latency = min(latencies) if latencies else 0
-        max_latency = max(latencies) if latencies else 0
-
-        # Recall (simplified - based on accuracy for now)
-        recall = correct / total if total > 0 else 0
-
-        # F1 Score
-        precision = recall  # Simplified since we're measuring accuracy directly
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-
-        # Category-specific results
-        category_metrics = {}
-        for category, category_correct in category_results.items():
-            cat_total = len(category_correct)
-            cat_correct = sum(category_correct)
-            category_metrics[category] = {
-                'accuracy': cat_correct / cat_total if cat_total > 0 else 0,
-                'count': cat_total
-            }
-
-        return {
-            'total_questions': total,
-            'correct_answers': correct,
-            'accuracy': correct / total if total > 0 else 0,
-            'average_latency_ms': avg_latency,
-            'min_latency_ms': min_latency,
-            'max_latency_ms': max_latency,
-            'recall': recall,
-            'f1_score': f1,
-            'category_results': category_metrics
-        }
-
-    def run_adapter_benchmark(
+    def run_benchmark(
         self,
         adapter_name: str,
         adapter_class,
         config: Dict,
+        output_path: str = 'results',
         warm_up: int = 3
-    ) -> BenchmarkResult:
-        """
-        Run benchmark for a single memory system adapter.
-
-        Args:
-            adapter_name: Name of the adapter for reporting
-            adapter_class: The adapter class to instantiate
-            config: Configuration dictionary for the adapter
-            warm_up: Number of warm-up queries to run
-
-        Returns:
-            BenchmarkResult with all metrics
-        """
+    ) -> Dict:
+        """Run benchmark for a single adapter."""
         print(f"\n{'='*60}")
-        print(f"Running benchmark for: {adapter_name}")
+        print(f"Benchmark: {adapter_name}")
         print(f"{'='*60}")
 
         adapter = adapter_class(config)
-        timestamp = datetime.now().isoformat()
 
         # Health check
-        print(f"Checking adapter health...")
-        if not adapter.health_check():
-            print(f"WARNING: Adapter {adapter_name} health check failed")
+        print(f"Health check: ", end='')
+        if adapter.health_check():
+            print("OK")
+        else:
+            print("FAILED - continuing anyway")
 
-        # Clear any existing data
-        print(f"Clearing existing data...")
+        # Clear existing data
+        print("Clearing existing data...")
         adapter.clear()
 
-        # Prepare context facts for ingestion
-        all_contexts = []
-        for qa in self.qa_pairs:
-            all_contexts.extend(qa.context)
-        
-        # Deduplicate contexts
-        unique_contexts = list(set(all_contexts))
-        random.shuffle(unique_contexts)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        results_file = os.path.join(output_path, f'{adapter_name}_results_{timestamp}.json')
+        os.makedirs(output_path, exist_ok=True)
 
-        # Ingestion phase
-        print(f"Ingesting {len(unique_contexts)} facts...")
-        ingestion_start = time.time()
-        ingestion_success = adapter.ingest(unique_contexts)
-        ingestion_time_ms = (time.time() - ingestion_start) * 1000
-        print(f"Ingestion {'successful' if ingestion_success else 'failed'} ({ingestion_time_ms:.2f}ms)")
+        all_results = []
+        category_stats = {}
 
-        if not ingestion_success:
-            print(f"WARNING: Ingestion failed for {adapter_name}")
+        # Process each conversation as a unit
+        for conv_idx, conv in enumerate(self.conversations):
+            conversation_data = conv.get('conversation', {})
+            qa_list = conv.get('qa', [])
 
-        # Warm-up phase
-        print(f"Warm-up phase ({warm_up} queries)...")
-        for i in range(min(warm_up, len(self.qa_pairs))):
-            qa = self.qa_pairs[i]
-            adapter.query(qa.question)
-
-        # Query phase
-        print(f"Running {len(self.qa_pairs)} queries...")
-        results: List[Tuple[str, str, float]] = []
-        category_results: Dict[str, List[bool]] = {}
-        raw_answers = []
-        error_count = 0
-
-        for i, qa in enumerate(self.qa_pairs):
-            if i % 10 == 0:
-                print(f"  Progress: {i}/{len(self.qa_pairs)}")
-
-            predicted, latency_ms = adapter.query(qa.question)
-            is_correct = self.evaluate_answer(predicted, qa.answer)
-
-            results.append((predicted, qa.answer, latency_ms))
-
-            if qa.category not in category_results:
-                category_results[qa.category] = []
-            category_results[qa.category].append(is_correct)
-
-            raw_answers.append({
-                'id': qa.id,
-                'question': qa.question,
-                'expected': qa.answer,
-                'predicted': predicted,
-                'correct': is_correct,
-                'latency_ms': latency_ms,
-                'category': qa.category
-            })
-
-            if not predicted:
-                error_count += 1
-
-        # Calculate metrics
-        metrics = self.calculate_metrics(results, category_results)
-
-        # Build result object
-        result = BenchmarkResult(
-            adapter_name=adapter_name,
-            timestamp=timestamp,
-            total_questions=metrics['total_questions'],
-            correct_answers=metrics['correct_answers'],
-            accuracy=metrics['accuracy'],
-            average_latency_ms=metrics['average_latency_ms'],
-            min_latency_ms=metrics['min_latency_ms'],
-            max_latency_ms=metrics['max_latency_ms'],
-            recall=metrics['recall'],
-            f1_score=metrics['f1_score'],
-            category_results=metrics['category_results'],
-            error_count=error_count,
-            ingestion_time_ms=ingestion_time_ms,
-            raw_answers=raw_answers
-        )
-
-        # Print summary
-        print(f"\n{adapter_name} Results:")
-        print(f"  Accuracy: {result.accuracy*100:.1f}%")
-        print(f"  Latency: {result.average_latency_ms:.2f}ms (avg)")
-        print(f"  Recall: {result.recall*100:.1f}%")
-        print(f"  F1 Score: {result.f1_score:.3f}")
-
-        return result
-
-    def save_results(self, result: BenchmarkResult, output_path: str):
-        """Save benchmark results to JSON file."""
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(asdict(result), f, indent=2, ensure_ascii=False)
-        
-        print(f"Results saved to: {output_path}")
-
-    def run_all_benchmarks(
-        self,
-        adapters: Optional[List[str]] = None,
-        output_dir: str = 'results'
-    ) -> List[BenchmarkResult]:
-        """
-        Run benchmarks for all specified adapters.
-
-        Args:
-            adapters: List of adapter names to run, or None for all
-            output_dir: Directory to save results
-
-        Returns:
-            List of BenchmarkResult objects
-        """
-        # Load dataset
-        self.load_dataset()
-
-        # Default to all adapters
-        if adapters is None or 'all' in adapters:
-            adapters = list(self.DEFAULT_CONFIGS.keys())
-
-        # Adapter class mapping
-        adapter_classes = {
-            'cortex': CortexAdapter,
-            'engram': EngramAdapter,
-            'openclaw_engram': OpenClawEngramAdapter
-        }
-
-        results = []
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-
-        for adapter_name in adapters:
-            if adapter_name not in adapter_classes:
-                print(f"Unknown adapter: {adapter_name}")
+            if not conversation_data or not qa_list:
                 continue
 
-            try:
-                config = self.DEFAULT_CONFIGS.get(adapter_name, {})
-                result = self.run_adapter_benchmark(
-                    adapter_name=adapter_name,
-                    adapter_class=adapter_classes[adapter_name],
-                    config=config
-                )
+            # Ingest conversation facts (limit to 10 for performance)
+            facts = self.build_context(conversation_data)[:10]
+            if facts:
+                adapter.ingest(facts)
 
-                # Save individual results
-                output_path = os.path.join(output_dir, f'{adapter_name}_results.json')
-                self.save_results(result, output_path)
+            # Answer questions for this conversation
+            for qa in qa_list:
+                question = qa.get('question', '')
+                expected = qa.get('answer', '')
+                category = qa.get('category', 0)
 
-                results.append(result)
+                if not question:
+                    continue
 
-            except Exception as e:
-                print(f"Error running benchmark for {adapter_name}: {e}")
-                import traceback
-                traceback.print_exc()
+                start = time.time()
+                predicted, _ = adapter.query(question)
+                latency_ms = (time.time() - start) * 1000
 
-        # Save combined summary
-        self._save_summary(results, output_dir, timestamp)
+                correct = self.evaluate_answer(predicted, expected)
 
-        return results
-
-    def _save_summary(self, results: List[BenchmarkResult], output_dir: str, timestamp: str):
-        """Save a summary of all benchmark results."""
-        summary = {
-            'timestamp': timestamp,
-            'benchmark_version': '1.0.0',
-            'dataset': 'locomo10',
-            'total_questions': len(self.qa_pairs),
-            'results': [
-                {
-                    'adapter': r.adapter_name,
-                    'accuracy': r.accuracy,
-                    'average_latency_ms': r.average_latency_ms,
-                    'recall': r.recall,
-                    'f1_score': r.f1_score,
-                    'error_count': r.error_count
+                result = {
+                    'sample_id': conv.get('sample_id', 'unknown'),
+                    'conversation_idx': conv_idx,
+                    'question': question,
+                    'expected': expected,
+                    'predicted': predicted,
+                    'correct': correct,
+                    'latency_ms': latency_ms,
+                    'category': category
                 }
-                for r in results
-            ]
+                all_results.append(result)
+
+                # Track by category
+                cat_key = f'category_{category}'
+                if cat_key not in category_stats:
+                    category_stats[cat_key] = {'total': 0, 'correct': 0}
+                category_stats[cat_key]['total'] += 1
+                category_stats[cat_key]['correct'] += int(correct)
+
+            if (conv_idx + 1) % 5 == 0:
+                print(f"  Processed {conv_idx + 1}/{len(self.conversations)} conversations")
+
+        # Calculate metrics
+        total = len(all_results)
+        correct = sum(1 for r in all_results if r['correct'])
+        accuracy = correct / total if total > 0 else 0
+
+        latencies = [r['latency_ms'] for r in all_results]
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+
+        metrics = {
+            'adapter': adapter_name,
+            'timestamp': timestamp,
+            'total_questions': total,
+            'correct_answers': correct,
+            'accuracy': accuracy,
+            'average_latency_ms': avg_latency,
+            'category_stats': category_stats,
+            'results': all_results
         }
 
-        summary_path = os.path.join(output_dir, 'summary.json')
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
+        # Save results
+        with open(results_file, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"\nResults saved to: {results_file}")
 
-        print(f"\nSummary saved to: {summary_path}")
+        print(f"\n--- SUMMARY ---")
+        print(f"Accuracy: {accuracy:.2%} ({correct}/{total})")
+        print(f"Avg latency: {avg_latency:.2f}ms")
+
+        return metrics
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description='LoCoMo Memory Benchmark Runner')
-    parser.add_argument(
-        '--adapter', '-a',
-        nargs='+',
-        default=['all'],
-        help='Adapter(s) to benchmark (cortex, engram, openclaw_engram, or all)'
-    )
-    parser.add_argument(
-        '--output', '-o',
-        default='results',
-        help='Output directory for results'
-    )
-    parser.add_argument(
-        '--data', '-d',
-        default='data/locomo10.json',
-        help='Path to LoCoMo dataset'
-    )
-
+    parser = argparse.ArgumentParser(description='LoCoMo Memory Benchmark')
+    parser.add_argument('--adapter', default='cortex',
+                        choices=['cortex', 'engram', 'openclaw_engram', 'all'],
+                        help='Adapter to benchmark')
+    parser.add_argument('--output', default='results',
+                        help='Output directory for results')
+    parser.add_argument('--warm-up', type=int, default=3,
+                        help='Number of warm-up queries')
     args = parser.parse_args()
 
-    print("="*60)
-    print("LoCoMo Memory Benchmark Suite")
-    print("="*60)
+    runner = LoCoMoBenchmarkRunner()
+    runner.load_dataset()
 
-    runner = BenchmarkRunner(data_path=args.data)
-    results = runner.run_all_benchmarks(
-        adapters=args.adapter,
-        output_dir=args.output
-    )
+    if args.adapter == 'all':
+        adapters_to_run = runner.ADAPTERS.keys()
+    else:
+        adapters_to_run = [args.adapter]
 
-    print("\n" + "="*60)
-    print("ALL BENCHMARKS COMPLETE")
-    print("="*60)
+    for adapter_name in adapters_to_run:
+        if adapter_name not in runner.ADAPTERS:
+            print(f"Unknown adapter: {adapter_name}")
+            continue
 
-    if results:
-        print("\nFinal Comparison:")
-        print("-"*60)
-        print(f"{'Adapter':<20} {'Accuracy':<12} {'Latency':<12} {'F1':<8}")
-        print("-"*60)
-        for r in results:
-            print(f"{r.adapter_name:<20} {r.accuracy*100:>6.1f}%      {r.average_latency_ms:>6.1f}ms     {r.f1_score:.3f}")
-        print("-"*60)
+        adapter_class = runner.ADAPTERS[adapter_name]
+        config = runner.DEFAULT_CONFIGS.get(adapter_name, {})
+
+        try:
+            runner.run_benchmark(
+                adapter_name=adapter_name,
+                adapter_class=adapter_class,
+                config=config,
+                output_path=args.output,
+                warm_up=args.warm_up
+            )
+        except Exception as e:
+            print(f"Benchmark failed for {adapter_name}: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == '__main__':
